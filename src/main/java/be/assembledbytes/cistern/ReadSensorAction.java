@@ -32,7 +32,7 @@ public class ReadSensorAction {
     private static final double VOLTAGE_MAX = 2.4;
     private static final double VOLTAGE_RANGE = VOLTAGE_MAX - VOLTAGE_MIN;
     private static final int MAX_HEIGHT_M = 3;
-    private static final double R = 0.14;
+    private static final double R = 1.25;
 
     private static final Properties readDatabaseConfig() throws IOException {
         final Properties props = new Properties();
@@ -49,9 +49,11 @@ public class ReadSensorAction {
             i2cDevice.open();
 
             final ADC adc = new ADS1115(i2cDevice, SENSOR_ADDRESS);
+
             final double voltage = adc.voltage(SENSOR_CHANNEL);
 
             final double height = ((voltage - VOLTAGE_MIN) / VOLTAGE_RANGE) * MAX_HEIGHT_M;
+
             return height > 0.0 ?
                    (Math.PI * Math.pow(R, 2) * height) * 1000 :
                    0.0;
