@@ -15,10 +15,6 @@ import org.slf4j.LoggerFactory;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
 import java.util.Properties;
 
 public class ReadSensorAction {
@@ -47,7 +43,9 @@ public class ReadSensorAction {
     private static final Properties readConfig() throws IOException {
         final Properties props = new Properties();
 
-        props.load(new FileInputStream("cistern.properties"));
+        try (final FileInputStream stream = new FileInputStream("cistern.properties")) {
+            props.load(stream);
+        }
 
         return props;
     }
