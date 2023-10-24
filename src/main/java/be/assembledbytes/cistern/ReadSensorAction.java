@@ -4,11 +4,17 @@ import be.assembledbytes.linux.i2c.I2CDev;
 import be.assembledbytes.linux.i2c.I2CDevImpl;
 import be.assembledbytes.linux.sensor.ADC;
 import be.assembledbytes.linux.sensor.ADS1115;
+import org.eclipse.paho.client.mqttv3.IMqttClient;
+import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -21,9 +27,13 @@ public class ReadSensorAction {
 
     private static final String I2C_DEVICE = "/dev/i2c-1";
 
-    private static final String PROP_DB_URL = "database.url";
-    private static final String PROP_DB_USER = "database.user";
-    private static final String PROP_DB_PASSWORD = "database.password";
+    /** The topic to post on. */
+    private static final String TOPIC = "/home/sensor/cistern/volume";
+
+    /** The publisher ID. */
+    private static final String PUBLISHER_ID = "cistern";
+
+    private static final String PROP_MQTT_HOST = "mqtt.host";
 
     private static final int SENSOR_ADDRESS = 0x48;
     private static final int SENSOR_CHANNEL = 0;
@@ -34,72 +44,69 @@ public class ReadSensorAction {
     private static final int MAX_HEIGHT_M = 3;
     private static final double R = 1.25;
 
-    private static final Properties readDatabaseConfig() throws IOException {
+    private static final Properties readConfig() throws IOException {
         final Properties props = new Properties();
 
-        props.load(new FileInputStream("database.properties"));
+        props.load(new FileInputStream("cistern.properties"));
 
         return props;
     }
 
-    private static final double readLiters() {
-        final I2CDev i2cDevice = new I2CDevImpl(I2C_DEVICE);
+    private static final double readLiters(final ADC adc) {
+        final double voltage = adc.voltage(SENSOR_CHANNEL);
+        final double height = ((voltage - VOLTAGE_MIN) / VOLTAGE_RANGE) * MAX_HEIGHT_M;
 
-        try {
-            i2cDevice.open();
-
-            final ADC adc = new ADS1115(i2cDevice, SENSOR_ADDRESS);
-
-            final double voltage = adc.voltage(SENSOR_CHANNEL);
-
-            final double height = ((voltage - VOLTAGE_MIN) / VOLTAGE_RANGE) * MAX_HEIGHT_M;
-
-            return height > 0.0 ?
-                   (Math.PI * Math.pow(R, 2) * height) * 1000 :
-                   0.0;
-        } finally {
-            i2cDevice.close();
-        }
-    }
-
-    private static final void storeData(final double liters) {
-        Connection connection = null;
-
-        try {
-            final Properties dbConfig = readDatabaseConfig();
-
-            connection = DriverManager.getConnection(dbConfig.getProperty(PROP_DB_URL),
-                                                     dbConfig.getProperty(PROP_DB_USER),
-                                                     dbConfig.getProperty(PROP_DB_PASSWORD));
-
-            final PreparedStatement statement = connection.prepareStatement("insert into measurements(timestamp, liters) values (now(), ?)");
-            statement.setDouble(1, liters);
-
-            statement.executeUpdate();
-        } catch (IOException e) {
-            throw new IllegalStateException(String.format("Error loading database configuration : [%s]",
-                                                          e.getMessage()),
-                                            e);
-        } catch (SQLException e) {
-            throw new IllegalStateException(String.format("Error storing data : [%s]",
-                                                          e.getMessage()),
-                                            e);
-        } finally {
-            if (connection != null) {
-                try {
-                    connection.close();
-                } catch (SQLException e) {
-                    // :shrug:
-                }
-            }
-        }
+        return height > 0.0 ?
+               (Math.PI * Math.pow(R, 2) * height) * 1000 :
+               0.0;
     }
 
     public static void main(String[] args) {
-        final double liters = readLiters();
+        I2CDev adcI2CDevice = null;
 
-        logger.info("Measurement : [{}] liters.", liters);
+        try {
+            final Properties config = readConfig();
 
-        storeData(liters);
+            adcI2CDevice = new I2CDevImpl(I2C_DEVICE);
+            adcI2CDevice.open();
+
+            final ADS1115 adc = new ADS1115(adcI2CDevice, SENSOR_ADDRESS);
+
+            while (true) {
+                final int liters = Double.valueOf(readLiters(adc)).intValue();
+
+                logger.info("Liters in cistern : {}", liters);
+
+                final MqttMessage message = new MqttMessage();
+                message.setPayload(String.valueOf(liters).getBytes(StandardCharsets.UTF_8));
+                message.setRetained(false);
+
+                final MqttConnectOptions mqttConnectOptions = new MqttConnectOptions();
+                mqttConnectOptions.setAutomaticReconnect(true);
+                mqttConnectOptions.setCleanSession(true);
+                mqttConnectOptions.setConnectionTimeout(10);
+
+                try {
+                    final IMqttClient mqttClient = new MqttClient(config.getProperty(PROP_MQTT_HOST), PUBLISHER_ID);
+
+                    mqttClient.connect();
+                    mqttClient.publish(TOPIC, message);
+
+                    mqttClient.disconnect();
+                } catch (MqttException e) {
+                    logger.error(String.format("Error publishing to MQTT : %s", e.getMessage()), e);
+                }
+
+                Thread.sleep(30000);
+            }
+        } catch (IOException e) {
+            logger.error(String.format("Error reading configuration : %s", e.getMessage()), e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            if (adcI2CDevice != null && adcI2CDevice.isOpen()) {
+                adcI2CDevice.close();
+            }
+        }
     }
 }
