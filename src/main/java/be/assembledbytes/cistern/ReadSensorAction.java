@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Properties;
 
 public class ReadSensorAction {
@@ -40,6 +41,18 @@ public class ReadSensorAction {
     private static final int MAX_HEIGHT_M = 3;
     private static final double R = 1.25;
 
+    /** Capacity of the cistern, derived from its geometry. */
+    private static final double CAPACITY_LITERS = Math.PI * Math.pow(R, 2) * MAX_HEIGHT_M * 1000;
+
+    /** Number of ADC conversions to take per reading. */
+    private static final int SAMPLES = 16;
+
+    /** Interval between readings. */
+    private static final long READ_INTERVAL_MS = 30000L;
+
+    /** Connection timeout, in seconds. */
+    private static final int CONNECTION_TIMEOUT_S = 10;
+
     private static final Properties readConfig() throws IOException {
         final Properties props = new Properties();
 
@@ -50,17 +63,106 @@ public class ReadSensorAction {
         return props;
     }
 
+    /**
+     * Read the sensor voltage, filtered.
+     *
+     * A single conversion carries around 4 mV of noise from the current loop, which the
+     * 7670 L/V transfer function below turns into some 30 liters of scatter. That noise is
+     * zero mean, so the median of a burst of conversions removes it without the lag a filter
+     * spanning publish cycles would introduce. The median rather than the mean so that a
+     * single outlier cannot move the result.
+     *
+     * @param   adc     The ADC to read from.
+     *
+     * @return  The median of {@link #SAMPLES} conversions, in volts.
+     */
+    private static final double readVoltage(final ADC adc) {
+        final double[] samples = new double[SAMPLES];
+
+        for (int sample = 0; sample < SAMPLES; sample++) {
+            samples[sample] = adc.voltage(SENSOR_CHANNEL);
+        }
+
+        Arrays.sort(samples);
+
+        return (samples[(SAMPLES - 1) / 2] + samples[SAMPLES / 2]) / 2.0;
+    }
+
     private static final double readLiters(final ADC adc) {
-        final double voltage = adc.voltage(SENSOR_CHANNEL);
+        final double voltage = readVoltage(adc);
         final double height = ((voltage - VOLTAGE_MIN) / VOLTAGE_RANGE) * MAX_HEIGHT_M;
 
-        return height > 0.0 ?
-               (Math.PI * Math.pow(R, 2) * height) * 1000 :
-               0.0;
+        return Math.clamp((Math.PI * Math.pow(R, 2) * height) * 1000, 0.0, CAPACITY_LITERS);
+    }
+
+    /**
+     * The options to connect to the broker with.
+     *
+     * @return  The connect options.
+     */
+    private static final MqttConnectOptions connectOptions() {
+        final MqttConnectOptions options = new MqttConnectOptions();
+
+        options.setAutomaticReconnect(true);
+        options.setCleanSession(true);
+        options.setConnectionTimeout(CONNECTION_TIMEOUT_S);
+
+        return options;
+    }
+
+    /**
+     * Publish a reading, connecting first if the client is not connected.
+     *
+     * The client stays connected between readings, so in the normal case this only publishes.
+     * Automatic reconnect only engages once a first connect has succeeded, so a broker that
+     * was not up when we started still has to be picked up here.
+     *
+     * @param   mqttClient  The client to publish on.
+     * @param   options     The options to connect with.
+     * @param   liters      The reading to publish.
+     */
+    private static final void publish(final IMqttClient mqttClient,
+                                      final MqttConnectOptions options,
+                                      final int liters) {
+        try {
+            if (!mqttClient.isConnected()) {
+                logger.info("Connecting to MQTT broker : {}", mqttClient.getServerURI());
+
+                mqttClient.connect(options);
+            }
+
+            final MqttMessage message = new MqttMessage();
+            message.setPayload(String.valueOf(liters).getBytes(StandardCharsets.UTF_8));
+            message.setRetained(false);
+
+            mqttClient.publish(TOPIC, message);
+        } catch (MqttException e) {
+            logger.error(String.format("Error publishing to MQTT : %s", e.getMessage()), e);
+        }
+    }
+
+    /**
+     * Close the MQTT client, releasing its threads and its persistence directory.
+     *
+     * @param   mqttClient  The client to close, may be null.
+     */
+    private static final void close(final IMqttClient mqttClient) {
+        if (mqttClient != null) {
+            try {
+                if (mqttClient.isConnected()) {
+                    mqttClient.disconnect();
+                }
+
+                mqttClient.close();
+            } catch (MqttException e) {
+                logger.error(String.format("Error closing MQTT client : %s", e.getMessage()), e);
+            }
+        }
     }
 
     public static void main(String[] args) {
         I2CDev adcI2CDevice = null;
+        IMqttClient mqttClient = null;
 
         try {
             final Properties config = readConfig();
@@ -70,40 +172,28 @@ public class ReadSensorAction {
 
             final ADS1115 adc = new ADS1115(adcI2CDevice, SENSOR_ADDRESS);
 
+            final MqttConnectOptions options = connectOptions();
+
+            mqttClient = new MqttClient(config.getProperty(PROP_MQTT_HOST), PUBLISHER_ID);
+
             while (true) {
                 final int liters = Double.valueOf(readLiters(adc)).intValue();
 
                 logger.info("Liters in cistern : {}", liters);
 
-                final MqttMessage message = new MqttMessage();
-                message.setPayload(String.valueOf(liters).getBytes(StandardCharsets.UTF_8));
-                message.setRetained(false);
+                publish(mqttClient, options, liters);
 
-                final MqttConnectOptions mqttConnectOptions = new MqttConnectOptions();
-                mqttConnectOptions.setAutomaticReconnect(true);
-                mqttConnectOptions.setCleanSession(true);
-                mqttConnectOptions.setConnectionTimeout(10);
-
-                logger.info("Connecting to MQTT broker : {}", config.getProperty(PROP_MQTT_HOST));
-
-                try {
-                    final IMqttClient mqttClient = new MqttClient(config.getProperty(PROP_MQTT_HOST), PUBLISHER_ID);
-
-                    mqttClient.connect();
-                    mqttClient.publish(TOPIC, message);
-
-                    mqttClient.disconnect();
-                } catch (MqttException e) {
-                    logger.error(String.format("Error publishing to MQTT : %s", e.getMessage()), e);
-                }
-
-                Thread.sleep(30000);
+                Thread.sleep(READ_INTERVAL_MS);
             }
         } catch (IOException e) {
             logger.error(String.format("Error reading configuration : %s", e.getMessage()), e);
+        } catch (MqttException e) {
+            logger.error(String.format("Could not create MQTT client : %s", e.getMessage()), e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {
+            close(mqttClient);
+
             if (adcI2CDevice != null && adcI2CDevice.isOpen()) {
                 adcI2CDevice.close();
             }
