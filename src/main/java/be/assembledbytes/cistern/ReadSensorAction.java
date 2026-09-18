@@ -84,6 +84,8 @@ public class ReadSensorAction {
                 mqttConnectOptions.setCleanSession(true);
                 mqttConnectOptions.setConnectionTimeout(10);
 
+                logger.info("Connecting to MQTT broker : {}", config.getProperty(PROP_MQTT_HOST));
+
                 try {
                     final IMqttClient mqttClient = new MqttClient(config.getProperty(PROP_MQTT_HOST), PUBLISHER_ID);
 

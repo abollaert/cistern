@@ -10,8 +10,8 @@
     <version>1.0.0-SNAPSHOT</version>
 
     <properties>
-        <maven.compiler.target>18</maven.compiler.target>
-        <maven.compiler.source>18</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <maven.compiler.source>21</maven.compiler.source>
 
         <jna.linux.version>1.0.0-SNAPSHOT</jna.linux.version>
         <mqtt.client.version>1.2.5</mqtt.client.version>
